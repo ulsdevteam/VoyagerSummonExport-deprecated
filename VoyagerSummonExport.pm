@@ -103,6 +103,7 @@ use MARC::File::Encode;
 		};
 		return $retVal;
 	};
+        use warnings 'redefine';
 }
 
 
@@ -136,6 +137,7 @@ sub new {
 		'history_directory' => $param{'history_directory'} || $unset,
 		'update_history_directory' => $param{'update_history_directory'} || $param{'history_directory'} || $unset,
 		'delete_history_directory' => $param{'delete_history_directory'} || $param{'history_directory'} || $unset,
+		'use_sftp' => $param{'use_sftp'} || $unset,
 		'ls' => $param{'ls'} || 'ls',
 		'tail' => $param{'tail'} || 'tail',
 		'head' => $param{'head'} || 'head',
@@ -155,7 +157,7 @@ sub new {
 			# add a trailing slash to directory parameters if missing
 			$self->{$k} .= '/' unless ($self->{$k} =~ m'/$');
 			unless ( -w $self->{$k} ) {
-				# warn if required parameter is missing
+				# warn if required parameter is invalid
 				my($e) = 'directory "'.$k.'" is not writeable';
 				_error($self, $e);
 				warn $e;
@@ -578,7 +580,7 @@ sub exportChanges {
 			while (my $record = $batch->next()) {
 				$logcount++;
 				$rowcount++;
-				print OUTFILE $record->field('001')->as_string()."\n";
+				print OUTFILE $record->field('004')->as_string()."\n";
 			}
 			print 'Adding '.$logcount.' records from log'."\n" if ($self->{'debug'});
 		}
@@ -762,17 +764,6 @@ sub sendFull {
 # Uploads a MARC file to the Summon via preferred protocol
 # required parameter is the MARC filename and type of upload (0 = delete, 1 = update, 2 = full)
 # returns undef on error, or true on success
-# SIDE EFFECT: if delete_history_directory / update_history_directory is set, will move the file there;
-#    otherwise, the file will be deleted
-sub sendFull {
-	my $self = shift;
-	my($f) = @_;
-	return $self->_send_file($f, 2);
-}
-
-# Uploads a MARC file to the Summon via preferred protocol
-# required parameter is the MARC filename and type of upload (0 = delete, 1 = update, 2 = full)
-# returns undef on error, or true on success
 sub _send_file {
 	my $self = shift;
 	my($filename, $type) = @_;
@@ -785,7 +776,7 @@ sub _send_file {
 	# We have set this to ftp rather than sftp because Serials Solutions is currently using mod_sftp/0.9.7.
 	# This server software is known to be incompatible with Net::SFTP 0.10 (c.f Known Client Issues: http://www.proftpd.org/docs/contrib/mod_sftp.html)
 	# Symptoms are a hang on Net::SFTP->new() at KEXINIT
-	if ($self->_ftp_file($filename, $type)) {
+	if (($self->{'use_sftp'} && $self->_sftp_file($filename, $type)) || $self->_ftp_file($filename, $type)) {
 		if ($self->{($type ? 'update' : 'delete').'_history_directory'}) {
 			my($f) = $filename;
 			$f =~ s'.*/'';
