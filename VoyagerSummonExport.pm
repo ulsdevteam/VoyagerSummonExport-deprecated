@@ -1,79 +1,157 @@
 #!/m1/shared/bin/perl
-########################################################################
-#
-#  VoyagerSummonExport : "Export MARC records from Voyager for Summon"
-#
-#  Version: 1.0
-#
-#  2011-11-16
-#
-#  Created by Clinton Graham
-#    clinton.graham@utsa.edu
-#    210-458-6133
-#
-#  Loosely based on a presentation by John Greer of University of Montana at 
-#  ELUNA 2010: "Voyager to Summon". c.f. http://documents.el-una.org/506/
-#
-#  This script queries the Voyager database and checks deleted bibs/mfhds logs
-#  to create MARC exports of changed (added, changed, deleted, suppressed)
-#  records for export to the Summon discovery tool.
-#
-#  With the SQL queries, we are always looking at the latest data, but trying
-#  to filter based on the created and modified dates.  Data integrity will be
-#  lost as subsequent changes are made, but generally the script should be
-#  accurate for re-doing recent exports.  The output files may not be identical
-#  to what the output files were at a previous runtime, but they will not be
-#  inaccurate with respect to the latest changes.
-#  
-#  With the logs, we assume that we move the current logs to similar
-#  filenames (perhaps in a different location) with a suffix of the 
-#  date and time of the conclusion of the log. The command used to do such
-#  is moveLogs().  Once this is done, it beyond the scope of this application
-#  to undo.  If re-doing past exports, moveLogs() is not used.
-#  It is these log archives, not the current log files, which are checked for
-#  date validity and processed by exportChanges() and exportDeletes().
-#
-#  The general process is expected to be:
-#  moveLogs() :
-#    Move the current Voyager logs and touch new files in the log location.
-#    Wait for Voyager to stop writing to the inode, then return.
-#
-#  exportChanges($beginning_datetime, $ending_datetime) :
-#    Query the database for BIBs and/or MFHDs created or updated within the
-#    datetime range.  Write the BIB ids to a tempfile.  Search the logs for
-#    deleted MFHDs suffixed with a datetimestamp within the datetime range.
-#    Extract the BIB ids from the deleted MFHDs and append these to the 
-#    tempfile.  Extract the MARC records for the BIBs represented in the 
-#    tempfile via Pmarcexport.  Postprocess the MARC records, manipulating 
-#    certain MARC fields (856, 852).  Return the name of the postprocessed
-#    file.
-#
-#  sendChanges($filename) :
-#    Upload the changes file to Summon, storing or unlinking the original
-#    based on the presence or absense of the update_history_directory param.
-#
-#  exportDeletes($beginning_datetime, $ending_datetime) :
-#    Query the database for BIBs suppressed within the datetime range and 
-#    export the MARC records via Pmarcexport to a tempfile.  Search the logs
-#    for deleted BIBs suffixed with a datetimestamp with the datetime range.
-#    Concatenate the tempfile with any matching deleted BIB logs.  Return the 
-#    name of the concatenated file.
-#
-#  sendDeletes($filename) :
-#    Upload the deletes file to Summon, storing or unlinking the original
-#    based on the presence or absence of the delete_history_directory param.
-#
-#  DEBUGGING:
-#    Set debug in the constructor to trace the process.
-#      debug => 1: output trace messages to STDERR
-#      debug => 2: above, and add Pmarcexport messages and don't delete temp files
-#      debug => 3: above, and add SQL queries and merge of multiple MARC fields
-#      debug => 4: above, and add merge of any MARC fields
-#
-#  EXAMPLE:
-#    See the end of this file for an example of running the process.
-#
-########################################################################
+=pod
+=head1 NAME
+VoyagerSummonExport : "Export MARC records from Voyager for Summon"
+=head1 SYNOPSIS
+	# An example of running this script serially
+
+	my($exporter) = new VoyagerSummonExport(
+		#  Use the Oracle username and password credentials that
+		#  you use to run your Voyager Access canned reports.
+		'oracle_username' => 'ro_mydb',
+		'oracle_password' => '0bfu5cat3d',
+
+		# The next two variables should ONLY be supplied values IF you are
+		# installing this script on a NON-VOYAGER-DATABASE server and/or
+		# the current (circa 2011) Voyager Direct (RITS) hosted setup.
+		# Any server you install this script on MUST have have an Oracle
+		# client, Perl, and the requisite Perl modules.
+		'oracle_port' => '1521',
+		'oracle_server' => 'localhost',
+
+		#  To see what ORACLE_SID and ORACLE_HOME values you
+		#  should use, run the "env" command while logged in
+		#  to your Voyager server as the "voyager" user.
+		'oracle_sid' => 'VGER',
+		'oracle_home' => "/oracle/app/oracle/product/10.2.0.3/db_1",
+
+		#  Your Voyager database
+		'db_name' => 'mydb',
+
+		# The location of the voyager reports directory
+		# This will default to /m1/voyager/$db_name/rpt/ if not specified
+		'report_directory' => '/m1/voyager/mydb/rpt/',
+
+		# The location of the deleted files Archive
+		# This will default to $report_directory or /m1/voyager/$db_name/rpt/ if not specified
+		'archive_directory' => '/var/log/summon/rpt/',
+
+		# Your summon username and password (and target FTP if needed)
+		'summon_user' => 'mylib',
+		'summon_password' => '0bfu5cat3d',
+		'summon_site' => 'ftp.summon.serialssolutions.com',
+		
+		# Choose how you want to send holdings (default is none for bib-only)
+		# none: don't send holdings
+		# include: send holdings file seperately
+		# 852-856: grab 852/856 fields from MFHD and insert into BIB
+		'mfhd_option' => 'include',
+
+		# it is safer to specify locations of external executables
+		# it is optional if they are in your path and trusted
+		'Pmarcexport' => '/m1/voyager/mydb/sbin/Pmarcexport',
+		'ls' => '/bin/ls',
+		'cp' => '/bin/cp',
+		'cat' => '/bin/cat'
+		'head' => '/bin/head'
+		'tail' => '/bin/tail'
+	);
+
+	# minimally (and assuming the appropriate environment), the above could have been constructed as:
+	$exporter = new VoyagerSummonExport( 
+		'oracle_username' => 'ro_mydb',
+		'oracle_password => '0bfu5cat3d', 
+		'db_name' => 'mydb',
+		'summon_user' => 'mylib',
+		'summon_password' => '0bfu5cat3d',
+		'archive_directory' => '/var/log/summon/rpt'
+	);
+
+	# archive the logs, getting last modification times
+	my($previousTimestamp, $currentTimestamp) = $exporter->moveLogs();
+	my($file);
+	# export any changes since the last run
+	$file = $exporter->exportChanges($previousTimestamp, $currentTimestamp)."\n";
+	if ($exporter->is_error()) {
+		warn join("\n", $exporter->error_report());
+	} elsif ($file) {
+		if (-s $file) {
+			$exporter->sendChanges($file);
+			warn join("\n", $exporter->error_report()) if ($exporter->is_error());
+		}
+	}
+
+	# export any deletes since the last run
+	$file = $exporter->exportDeletes($previousTimestamp, $currentTimestamp)."\n";
+	if ($exporter->is_error()) {
+		warn join("\n", $exporter->error_report());
+	} elsif ($file) {
+		if (-s $file) {
+			$exporter->sendChanges($file);
+			warn join("\n", $exporter->error_report()) if ($exporter->is_error());
+		}
+	}
+	exit;
+
+
+=head1 DESCRIPTION
+Loosely based on a presentation by John Greer of University of Montana at 
+ELUNA 2010: "Voyager to Summon". c.f. http://documents.el-una.org/506/
+
+This script queries the Voyager database and checks deleted bibs/mfhds logs
+to create MARC exports of changed (added, changed, deleted, suppressed)
+records for export to the Summon discovery tool.
+
+With the SQL queries, we are always looking at the latest data, but trying
+to filter based on the created and modified dates.  Data integrity will be
+lost as subsequent changes are made, but generally the script should be
+accurate for re-doing recent exports.  The output files may not be identical
+to what the output files were at a previous runtime, but they will not be
+inaccurate with respect to the latest changes.
+  
+With the logs, we assume that we move the current logs to similar
+filenames (perhaps in a different location) with a suffix of the 
+date and time of the conclusion of the log. The command used to do such
+is moveLogs().  Once this is done, it beyond the scope of this application
+to undo.  If re-doing past exports, moveLogs() is not used.
+It is these log archives, not the current log files, which are checked for
+date validity and processed by exportChanges() and exportDeletes().
+
+The general process is expected to be:
+
+  moveLogs() :
+    Move the current Voyager logs and touch new files in the log location.
+    Wait for Voyager to stop writing to the inode, then return.
+
+  exportChanges($beginning_datetime, $ending_datetime) :
+    Query the database for BIBs and/or MFHDs created or updated within the
+    datetime range.  Write the BIB ids to a tempfile.  Search the logs for
+    deleted MFHDs suffixed with a datetimestamp within the datetime range.
+    Extract the BIB ids from the deleted MFHDs and append these to the 
+    tempfile.  Extract the MARC records for the BIBs represented in the 
+    tempfile via Pmarcexport.  Postprocess the MARC records, manipulating 
+    certain MARC fields (856, 852).  Return the names of the postprocessed
+    file.
+
+  sendChanges(@filenames) :
+    Upload the changes files to Summon, storing or unlinking the original
+    based on the presence or absense of the update_history_directory param.
+
+  exportDeletes($beginning_datetime, $ending_datetime) :
+    Query the database for BIBs suppressed within the datetime range and 
+    export the MARC records via Pmarcexport to a tempfile.  Search the logs
+    for deleted BIBs suffixed with a datetimestamp with the datetime range.
+    Concatenate the tempfile with any matching deleted BIB logs.  Return the 
+    names of the concatenated file.
+
+  sendDeletes(@filenames) :
+    Upload the deletes files to Summon, storing or unlinking the original
+    based on the presence or absence of the delete_history_directory param.
+
+=head1 DEBUGGING
+    Set debug in the constructor to trace the process.
+=cut
+
 package VoyagerSummonExport;
 
 use strict;
@@ -90,9 +168,9 @@ use MARC::File::Encode;
 # Override MARC::File::Encode::marc_to_utf8(), which was calling decode() with a CHECK param of 1.
 # This CHECK croaked on the $batch->next()
 {
-        package MARC::File::Encode;
-        no warnings 'redefine';
-        *marc_to_utf8 = sub { 
+	package MARC::File::Encode;
+	no warnings 'redefine';
+	*marc_to_utf8 = sub { 
 		my($retVal);
 		eval {
 			# Original code from MARC::File::Encode::marc_to_utf8() dies on malformed UTF8
@@ -103,11 +181,93 @@ use MARC::File::Encode;
 		};
 		return $retVal;
 	};
-        use warnings 'redefine';
+	use warnings 'redefine';
 }
 
+=pod
+=head1 METHODS
+=head2 new
+Constructor, expects a hash with parameters
 
-# Constructor, expects a hash with parameters
+	my($exporter) = VoyagerSummonExport->new( %parameters );
+
+=item debug
+Optional, integer: turns on debugging (default off)
+
+	debug => 0: off, none
+	debug => 1: output trace messages to STDERR
+	debug => 2: above, and add Pmarcexport messages and don't delete temp files
+	debug => 3: above, and add SQL queries and merge of multiple MARC fields
+	debug => 4: above, and add merge of any MARC fields
+
+=item oracle_username
+Required, string: The Oracle username for SQL connections
+
+=item oracle_password
+Required, string: The Oracle password for SQL connections
+
+=item oracle_port
+Optional, integer: The Oracle port for SQL connections.  Default is 1521.
+
+=item oracle_server
+Optional, string: The Oracle server name.  Default is localhost.
+
+=item db_name
+Required, string: The Oracle schema name.
+
+=item oracle_sid
+Required, string: The Oracle SID.  Default by pulling from ORACLE_SID in the environment.
+
+=item oracle_home
+Required, string: The path to the Oracle home directory.  Default by pulling from ORACLE_HOME in the environment.
+
+=item summon_user
+Required, string: The ftp/sftp username for Summon.
+
+=item summon_password
+Required, string: The ftp/sftp password for Summon.
+
+=item summon_site
+Optional, string: The DNS name of the Summon ftp/sftp site.  Default to 'ftp.summon.serialssolutions.com'.
+
+=item use_sftp
+Optional, boolean: Set this to use sftp instead of ftp.  We default to FTP because of a bug with mod_sftp/0.9.7 and Net::SFTP 0.10.
+
+=item report_directory
+Optional, string: The directory in which to find Voyager reports.  Defaults to '/m1/shared/$db_name/rpt/', where $db_name is the db_name parameter above.
+
+=item history_directory
+Optional, string: The directory in which to store update files and delete files which are sent to Summon.  If *history_directory directives are not specified, files are deleted after a successful send.  Trailing slash is optional.
+
+=item update_history_directory
+Optional, string: The directory in which to store update files which are sent to Summon.  Defaults to history_directory parameter.  If not specified, update files are deleted after a successful send.  Trailing slash is optional.
+
+=item delete_history_directory
+Optional, string: The directory in which to store delete files which are sent to Summon.  Defaults to history_directory parameter.  If not specified, delete files are deleted after a successful send.  Trailing slash is optional.
+
+=item temp_directory
+Optional, string: The directory for temporary file operations.  Defaults to '/tmp/'.  Trailing slash is optional.
+
+=item Pmarcexport
+Optional, string: Enables specifying the location of the system command that will be called in the program.  If not specified, defaults to just the command name as found in the PATH.
+
+=item ls
+Optional, string: Enables specifying the location of the system command that will be called in the program.  If not specified, defaults to just the command name as found in the PATH.
+
+=item tail
+Optional, string: Enables specifying the location of the system command that will be called in the program.  If not specified, defaults to just the command name as found in the PATH.
+
+=item head
+Optional, string: Enables specifying the location of the system command that will be called in the program.  If not specified, defaults to just the command name as found in the PATH.
+
+=item cp
+Optional, string: Enables specifying the location of the system command that will be called in the program.  If not specified, defaults to just the command name as found in the PATH.
+
+=item cat
+Optional, string: Enables specifying the location of the system command that will be called in the program.  If not specified, defaults to just the command name as found in the PATH.
+
+=cut
+
 sub new {
 	# get object class reference
 	my $class = shift;
@@ -157,7 +317,7 @@ sub new {
 			# add a trailing slash to directory parameters if missing
 			$self->{$k} .= '/' unless ($self->{$k} =~ m'/$');
 			unless ( -w $self->{$k} ) {
-				# warn if required parameter is invalid
+				# warn if directory parameter is invalid
 				my($e) = 'directory "'.$k.'" is not writeable';
 				_error($self, $e);
 				warn $e;
@@ -179,29 +339,14 @@ sub new {
 	return bless($self, $class);
 }
 
-# take a timestamp and format as an Oracle string
-sub _oracle_date {
-	my $self = shift;
-	my ($time) = @_;
-	my($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst);
-	($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime($time);
-	$mon+=1;
-	$year+=1900;
-	return sprintf('%04d-%02d-%02d %02d:%02d:%02d', $year, $mon, $mday, $hour, $min, $sec);
-}
+=pod
+=head2 lastTimespan
+Retreives the timespan of the last known run.  Returns are the stat()->mtime() of the prior log moved, and of the last log.
 
-# take a timestamp and format as an log date/timestamp
-sub _log_date {
-	my $self = shift;
-	my ($time) = @_;
-	my($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst);
-	($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime($time);
-	$mon+=1;
-	$year+=1900;
-	return sprintf('%04d%02d%02d.%02d%02d', $year, $mon, $mday, $hour, $min);
-}
+	my($fromDatetime, $toDatetime) = $exporter->lastTimespan( );
 
-# returns the datetime of the prior log moved, and the datetime of the last log
+=cut
+
 sub lastTimespan {
 	my $self = shift;
 	my($cmd, $f);
@@ -230,10 +375,14 @@ sub lastTimespan {
 	return $from, $to;
 }
 
-# Moves the deleted logs to the arcive location for use by this application
-# Waits to return until it looks like the copied logs are stable (not currently being written)
-# Pass a true parameter to fake the move
-# returns the datetime of the last log moved, and the datetime of the current stable log
+=pod
+=head2 moveLogs
+Moves the deleted logs to the archive location for use by this application.  Waits to return until it looks like the copied logs are stable (not currently being written).  Pass a true parameter to fake the move; defaults to false, which moves the active log.  Returns the datetime of the last log moved, and the datetime of the current stable log.
+
+	my($previousLogDatetime, $currentLogDatetime) = $exporter->moveLogs( $doNotMove );
+
+=cut
+
 sub moveLogs {
 	my $self = shift;
 	my($doNotMove) = shift;
@@ -304,9 +453,14 @@ sub moveLogs {
 	return $from, $to;
 }
 
-# Creates a MARC export of records changed
-# returns undef on error, or the filename of the MARC export
-# takes parameters of $beginDate and $endDate as timestamps
+=pod
+=head2 exportDeletes
+Creates a MARC export of records deleted.  Returns undef on error, or filename of the MARC export.  Takes parameters of $beginDate and $endDate as timestamps.
+
+	my($bibDeleteExport) = $exporter->exportDeletes( $beginDate, $endDate );
+
+=cut
+
 sub exportDeletes {
 	my $self = shift;
 	# parameters:
@@ -458,9 +612,14 @@ sub exportDeletes {
 	return $filename{'summon'};
 }
 
-# Creates a MARC export of records changed
-# returns undef on error, or the filename of the MARC export
-# takes parameters of $beginDate and $endDate as timestamps
+=pod
+=head2 exportChanges
+Creates a MARC export of records changed.  Returns undef on error, or filename of the MARC export.  Takes parameters of $beginDate and $endDate as timestamps.
+
+	my($bibChangeExport) = $exporter->exportChanges( $beginDate, $endDate );
+
+=cut
+
 sub exportChanges {
 	my $self = shift;
 	# parameters:
@@ -728,42 +887,109 @@ sub exportChanges {
 
 }
 
-# Uploads a MARC file to the Summon /deletes/ folder
-# required parameter is the MARC filename
-# returns undef on error, or true on success
-# SIDE EFFECT: if delete_history_directory is set, will move the file there;
-#    otherwise, the file will be deleted
+=pod
+=head2 sendDeletes
+Uploads a MARC file to the Summon /deletes/ folder.  Required parameter is the MARC filename.  Returns undef on error, or true on success. SIDE EFFECT: if delete_history_directory is set, will move the file there; otherwise, the file will be deleted.
+
+	my($success) = $exporter->sendDeletes( $filename );
+
+=cut
+
 sub sendDeletes {
 	my $self = shift;
 	my($f) = @_;
 	return $self->_send_file($f, 0);
 }
 
-# Uploads a MARC file to the Summon /updates/ folder
-# required parameter is the MARC filename
-# returns undef on error, or true on success
-# SIDE EFFECT: if update_history_directory is set, will move the file there;
-#    otherwise, the file will be deleted
+=pod
+=head2 sendChanges
+Uploads a MARC file to the Summon /updates/ folder. Required parameter is the MARC filename. Returns undef on error, or true on success. SIDE EFFECT: if update_history_directory is set, will move the file there; otherwise, the file will be deleted
+
+	my($success) = $exporter->sendChanges( $filename );
+
+=cut
+	
 sub sendChanges {
 	my $self = shift;
 	my($f) = @_;
 	return $self->_send_file($f, 1);
 }
 
-# Uploads a MARC file to the Summon /full/ folder
-# required parameter is the MARC filename
-# returns undef on error, or true on success
-# SIDE EFFECT: if update_history_directory is set, will move the file there;
-#    otherwise, the file will be deleted
+=pod
+=head2 sendFull
+Uploads a MARC file to the Summon /full/ folder.  Required parameter is the MARC filename.  Returns undef on error, or true on success.  SIDE EFFECT: if update_history_directory is set, will move the file there; otherwise, the file will be deleted
+
+	my($success) = $exporter->sendFull( $filename );
+
+=cut
+
 sub sendFull {
 	my $self = shift;
 	my($f) = @_;
 	return $self->_send_file($f, 2);
 }
 
+=pod
+=head2 is_error
+Check for error. Returns false if no error, true if error occurred
+
+	my($errorOccurred) = $exporter->is_error( );
+
+=cut
+
+sub is_error {
+	my $self = shift;
+	# just return true/false on whether the error content is set
+	return $self->{'error'} ? 1 : 0;
+}
+
+=pod
+=head2 error_report
+Report and clear last error message.  Returns an array of error messages.
+
+	my(@errorList) = $exporter->error_report( );
+=cut
+
+sub error_report {
+	my $self = shift;
+	# check for error content
+	if ($self->{'error'}) {
+		# return and clear the error
+		my (@err) = @{$self->{'error'}};
+		delete $self->{'error'};
+		return @err;
+	}
+	# no error, return false
+	return 0;
+}
+
+# take a timestamp and format as an Oracle string
+sub _oracle_date {
+	my $self = shift;
+	my ($time) = @_;
+	my($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst);
+	($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime($time);
+	$mon+=1;
+	$year+=1900;
+	return sprintf('%04d-%02d-%02d %02d:%02d:%02d', $year, $mon, $mday, $hour, $min, $sec);
+}
+
+# take a timestamp and format as an log date/timestamp
+sub _log_date {
+	my $self = shift;
+	my ($time) = @_;
+	my($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst);
+	($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime($time);
+	$mon+=1;
+	$year+=1900;
+	return sprintf('%04d%02d%02d.%02d%02d', $year, $mon, $mday, $hour, $min);
+}
+
 # Uploads a MARC file to the Summon via preferred protocol
 # required parameter is the MARC filename and type of upload (0 = delete, 1 = update, 2 = full)
 # returns undef on error, or true on success
+# SIDE EFFECT: if delete_history_directory / update_history_directory is set, will move the file there;
+#    otherwise, the file will be deleted
 sub _send_file {
 	my $self = shift;
 	my($filename, $type) = @_;
@@ -773,7 +999,7 @@ sub _send_file {
 		return;
 	}
 
-	# We have set this to ftp rather than sftp because Serials Solutions is currently using mod_sftp/0.9.7.
+	# We have set this to default to ftp rather than sftp because Serials Solutions is currently using mod_sftp/0.9.7.
 	# This server software is known to be incompatible with Net::SFTP 0.10 (c.f Known Client Issues: http://www.proftpd.org/docs/contrib/mod_sftp.html)
 	# Symptoms are a hang on Net::SFTP->new() at KEXINIT
 	if (($self->{'use_sftp'} && $self->_sftp_file($filename, $type)) || $self->_ftp_file($filename, $type)) {
@@ -868,37 +1094,15 @@ sub _fields_from_marc {
 	return @fields;
 }
 
-# Create a Serials Solution formatted MARC file name
+# Create a Summon formatted MARC file name
 sub _summon_filename {
+	# See formatting convention per: https://proquestsupport.force.com/portal/apex/homepage?id=kA0400000004J6wCAE&l=en_US
 	my $self = shift;
 	my($format, $time) = @_;
 	my($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime($time);
 	$mon=$mon+1;
 	$year=$year+1900;
-	return $self->{'db_name'}.'-'.$format.'-'.sprintf('%02d-%02d-%02d-%02d-%02d', $year, $mon, $mday, $hour, $min).'.marc';
-}
-
-# Check for error
-# returns false if no error, true if error occurred
-sub is_error {
-	my $self = shift;
-	# just return true/false on whether the error content is set
-	return $self->{'error'} ? 1 : 0;
-}
-
-# Report and clear last error message
-# returns an array of error messages
-sub error_report {
-	my $self = shift;
-	# check for error content
-	if ($self->{'error'}) {
-		# return and clear the error
-		my (@err) = @{$self->{'error'}};
-		delete $self->{'error'};
-		return @err;
-	}
-	# no error, return false
-	return 0;
+	return $self->{'summon_user'}.'-'.$format.'-'.sprintf('%02d-%02d-%02d-%02d-%02d', $year, $mon, $mday, $hour, $min).'.marc';
 }
 
 # Create a Database Handle
@@ -1007,88 +1211,8 @@ sub _error {
 1;
 __END__
 
-# An example of running this script serially
-
-my($exporter) = new VoyagerSummonExport(
-        #  Use the Oracle username and password credentials that
-        #  you use to run your Voyager Access canned reports.
-        'oracle_username' => 'ro_mydb',
-        'oracle_password' => '0bfu5cat3d',
-
-        # The next two variables should ONLY be supplied values IF you are
-        # installing this script on a NON-VOYAGER-DATABASE server and/or
-        # the current (circa 2011) Voyager Direct (RITS) hosted setup.
-        # Any server you install this script on MUST have have an Oracle
-        # client, Perl, and the requisite Perl modules.
-        'oracle_port' => '1521',
-        'oracle_server' => 'localhost',
-
-        #  To see what ORACLE_SID and ORACLE_HOME values you
-        #  should use, run the "env" command while logged in
-        #  to your Voyager server as the "voyager" user.
-        'oracle_sid' => 'VGER',
-        'oracle_home' => "/oracle/app/oracle/product/10.2.0/db_1",
-
-        #  Your Voyager database
-        'db_name' => 'mydb',
-
-	# The location of the voyager reports directory
-	# This will default to /m1/voyager/$db_name/rpt/ if not specified
-	'report_directory' => '/m1/voyager/mydb/rpt/',
-
-	# The location of the deleted files Archive
-	# This will default to $report_directory or /m1/voyager/$db_name/rpt/ if not specified
-	'archive_directory' => '/vbin/summon/rpt/',
-
-	# Your summon username and password (and target FTP if needed)
-	'summon_user' => 'username',
-	'summon_password' => '0bfu5cat3d',
-	'summon_site' => 'ftp.summon.serialssolutions.com',
-
-	# it is safer to specify locations of external executables
-	# it is optional if they are in your path and trusted
-	'Pmarcexport' => '/m1/voyager/mydb/sbin/Pmarcexport',
-	'ls' => '/bin/ls',
-	'cp' => '/bin/cp',
-	'cat' => '/bin/cat'
-	'head' => '/bin/head'
-	'tail' => '/bin/tail'
-);
-
-# minimally (and assuming the appropriate environment), the above could have been constructed as:
-$exporter = new VoyagerSummonExport( 
-	'oracle_username' => 'ro_mydb',
-	'oracle_password => '0bfu5cat3d', 
-	'db_name' => 'mydb',
-	'summon_user' => 'username',
-	'summon_password' => '0bfu5cat3d',
-	'archive_directory' => '/vbin/summon/rpt'
-);
-
-# archive the logs, getting last modification times
-my($previousTimestamp, $currentTimestamp) = $exporter->moveLogs();
-my($file);
-# export any changes since the last run
-$file = $exporter->exportChanges($previousTimestamp, $currentTimestamp)."\n";
-if ($exporter->is_error()) {
-	warn join("\n", $exporter->error_report());
-} elsif ($file) {
-	if (-s $file) {
-		$exporter->sendChanges($file);
-		warn join("\n", $exporter->error_report()) if ($exporter->is_error());
-	}
-}
-
-# export any deletes since the last run
-$file = $exporter->exportDeletes($previousTimestamp, $currentTimestamp)."\n";
-if ($exporter->is_error()) {
-	warn join("\n", $exporter->error_report());
-} elsif ($file) {
-	if (-s $file) {
-		$exporter->sendChanges($file);
-		warn join("\n", $exporter->error_report()) if ($exporter->is_error());
-	}
-}
-exit;
-
+=pod
+=head1 AUTHORS and MAINTAINERS
+  Created by Clinton Graham F<E<lt>ctgraham@pitt.edu<gt>> 412-383-1057
+=cut
 
