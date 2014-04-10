@@ -70,6 +70,9 @@
 #      debug => 3: above, and add SQL queries and merge of multiple MARC fields
 #      debug => 4: above, and add merge of any MARC fields
 #
+#  EXAMPLE:
+#    See the end of this file for an example of running the process.
+#
 ########################################################################
 package VoyagerSummonExport;
 
@@ -1033,7 +1036,7 @@ my($exporter) = new VoyagerSummonExport(
         #  should use, run the "env" command while logged in
         #  to your Voyager server as the "voyager" user.
         'oracle_sid' => 'VGER',
-        'oracle_home' => "/oracle/app/oracle/product/10.2.0.3/db_1",
+        'oracle_home' => "/oracle/app/oracle/product/10.2.0/db_1",
 
         #  Your Voyager database
         'db_name' => 'mydb',
